@@ -22,6 +22,10 @@
   const latestButton = document.querySelector("#latest-button");
   const latestName = document.querySelector("#latest-name");
   const video = document.querySelector("#video");
+  const playbackStatus = document.querySelector("#playback-status");
+  const playbackStatusTitle = document.querySelector("#playback-status-title");
+  const playbackStatusDetail = document.querySelector("#playback-status-detail");
+  const retryButton = document.querySelector("#retry-button");
 
   const streamRoutePrefix = "#stream/";
   const legacyLatestStorageKey = "ace-player.latest-content-id";
@@ -130,6 +134,7 @@
   }
 
   function showHome(message = "") {
+    hidePlaybackStatus();
     playerScreen.hidden = true;
     homeScreen.hidden = false;
     formMessage.textContent = message;
@@ -140,6 +145,55 @@
   function showPlayer() {
     homeScreen.hidden = true;
     playerScreen.hidden = false;
+  }
+
+  function setPlaybackStatus(title, detail = "", { error = false, retry = false } = {}) {
+    playbackStatusTitle.textContent = title;
+    playbackStatusDetail.textContent = detail;
+    playbackStatusDetail.hidden = !detail;
+    retryButton.hidden = !retry;
+    playbackStatus.classList.toggle("error", error);
+    playbackStatus.hidden = false;
+  }
+
+  function hidePlaybackStatus() {
+    playbackStatus.hidden = true;
+    playbackStatus.classList.remove("error");
+    retryButton.hidden = true;
+  }
+
+  function statusPeerDetail(data) {
+    const peers = Number(data.peers);
+    if (!Number.isFinite(peers) || peers <= 0) return "Waiting for a source to become available";
+    return `${peers} peer${peers === 1 ? "" : "s"} connected`;
+  }
+
+  function updateStatusFromEngine(data) {
+    if (firstFrameAt || !playbackWanted) return;
+    const status = String(data.status || "").toLowerCase();
+    if (status === "error" || status === "stopped") {
+      setPlaybackStatus("Stream unavailable", "The source stopped before Safari received video.", { error: true });
+      return;
+    }
+    const detail = statusPeerDetail(data);
+    if (detail.startsWith("Waiting")) {
+      setPlaybackStatus("Finding peers…", detail);
+      return;
+    }
+    setPlaybackStatus("Buffering stream…", detail);
+  }
+
+  function mediaErrorMessage() {
+    switch (video.error?.code) {
+      case MediaError.MEDIA_ERR_NETWORK:
+        return "The stream connection was interrupted";
+      case MediaError.MEDIA_ERR_DECODE:
+        return "Safari could not decode this stream";
+      case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
+        return "Safari does not support this stream format";
+      default:
+        return "The stream stopped unexpectedly";
+    }
   }
 
   function stopPlaybackMonitoring() {
@@ -181,6 +235,7 @@
     firstFrameAt ||= now;
     lastProgressAt = now;
     stallSince = 0;
+    hidePlaybackStatus();
     if (stablePlaybackTimer) window.clearTimeout(stablePlaybackTimer);
     const sessionID = currentSessionID;
     stablePlaybackTimer = window.setTimeout(() => {
@@ -189,7 +244,12 @@
   }
 
   function notePlaybackStall() {
-    if (playbackWanted && !video.paused && !stallSince) stallSince = Date.now();
+    if (playbackWanted && !video.paused) {
+      if (!stallSince) {
+        stallSince = Date.now();
+        setPlaybackStatus("Buffering…", "Waiting for the stream to catch up");
+      }
+    }
   }
 
   async function pollPlaybackStatus() {
@@ -218,7 +278,9 @@
       if (sessionID !== currentSessionID) return;
       if (data.status === "error" || data.status === "stopped") {
         scheduleReconnect(`engine status: ${data.status}`, true);
+        return;
       }
+      updateStatusFromEngine(data);
     } catch (_) {
       // The playback watchdog handles media stalls if the status request fails.
     } finally {
@@ -268,13 +330,25 @@
     if (!immediate && video.paused) return;
     if (reconnectAttempts >= maxReconnectAttempts) {
       console.warn(`Ace Player: automatic reconnect limit reached (${reason})`);
+      setPlaybackStatus(
+        "Could not start this stream",
+        "Safari did not receive playable video after several attempts.",
+        { error: true, retry: true },
+      );
       return;
     }
 
     const delay = immediate
       ? 0
       : Math.min(reconnectMaxDelay, reconnectBaseDelay * (2 ** reconnectAttempts));
-    reconnectAttempts += 1;
+    const attempt = reconnectAttempts + 1;
+    reconnectAttempts = attempt;
+    setPlaybackStatus(
+      immediate ? "Reconnecting…" : "Connection interrupted",
+      immediate
+        ? `Trying again (${attempt}/${maxReconnectAttempts})`
+        : `Trying again in ${Math.ceil(delay / 1000)} seconds (${attempt}/${maxReconnectAttempts})`,
+    );
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null;
       reconnectPromise = reconnectStream(reason).finally(() => {
@@ -313,6 +387,12 @@
     }
   }
 
+  async function retryPlayback() {
+    if (!playbackWanted || recoveryInProgress || !currentContentID) return;
+    cancelReconnect();
+    await reconnectStream("manual retry");
+  }
+
   function clearSearchResults() {
     activeSearchQuery = "";
     searchResults.hidden = true;
@@ -328,6 +408,7 @@
   }
 
   function resultMetadata(result) {
+    if (result.source === "public") return "Live index";
     const parts = [result.status === 2 ? "Available" : "Uncertain"];
     const language = result.languages?.[0];
     const country = result.countries?.[0];
@@ -366,7 +447,9 @@
       action.textContent = "▶";
       button.append(copy, action);
       button.addEventListener("click", () => {
-        void startStream(result.infohash, { source: "infohash", name: result.name });
+        const identifier = result.contentId || result.infohash;
+        const source = result.contentId ? "content_id" : "infohash";
+        void startStream(identifier, { source, name: result.name });
       });
       resultsList.append(button);
     }
@@ -451,6 +534,11 @@
     currentStreamName = name.trim();
     playbackWanted = true;
     if (!reconnecting) cancelReconnect();
+    showPlayer();
+    setPlaybackStatus(
+      reconnecting ? "Reconnecting…" : "Starting stream…",
+      reconnecting ? "Creating a fresh AceStream session" : "Connecting to the AceStream engine",
+    );
     const abortController = new AbortController();
     startAbortController = abortController;
     formMessage.hidden = true;
@@ -474,10 +562,15 @@
       saveLatest(currentContentID, source, name);
       if (pushHistory) pushStreamRoute(currentContentID, source);
       showPlayer();
+      setPlaybackStatus("Connecting…", "Waiting for Safari to receive the stream");
       video.src = data.manifestUrl;
       video.load();
       startPlaybackMonitoring(currentSessionID, { preserveReconnectAttempts: reconnecting });
-      void video.play().catch(() => {});
+      void video.play().catch((error) => {
+        if (error.name === "NotAllowedError" && playbackWanted && currentSessionID === data.sessionId) {
+          setPlaybackStatus("Ready to play", "Use Safari’s native play control to start the stream");
+        }
+      });
       return true;
     } catch (error) {
       if (error.name === "AbortError") return false;
@@ -503,6 +596,7 @@
     if (userInitiated) {
       playbackWanted = false;
       cancelReconnect();
+      hidePlaybackStatus();
     }
     const sessionID = currentSessionID;
     currentSessionID = "";
@@ -537,10 +631,20 @@
   video.addEventListener("waiting", notePlaybackStall);
   video.addEventListener("stalled", notePlaybackStall);
   video.addEventListener("error", () => {
-    if (playbackWanted) scheduleReconnect("media error", true);
+    if (playbackWanted) {
+      setPlaybackStatus(mediaErrorMessage(), "Trying to restore the connection");
+      scheduleReconnect("media error", true);
+    }
   });
   video.addEventListener("pause", () => {
-    if (!recoveryInProgress && !starting && currentSessionID) playbackWanted = false;
+    if (!recoveryInProgress && !starting && currentSessionID) {
+      playbackWanted = false;
+      hidePlaybackStatus();
+    }
+  });
+
+  retryButton.addEventListener("click", () => {
+    void retryPlayback();
   });
 
   searchForm.addEventListener("submit", (event) => {

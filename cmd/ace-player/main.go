@@ -25,6 +25,7 @@ import (
 const (
 	defaultPort            = "8080"
 	defaultEngine          = "http://acestream:6878"
+	defaultSearch          = "https://search-ace.stream"
 	defaultMaxSessions     = 4
 	sessionIdleTimeout     = 15 * time.Minute
 	sessionCleanupInterval = time.Minute
@@ -35,6 +36,7 @@ var contentIDPattern = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 
 type app struct {
 	engineURL   *url.URL
+	searchURL   *url.URL
 	client      *http.Client
 	webRoot     string
 	sessionsMu  sync.RWMutex
@@ -103,6 +105,12 @@ type engineSearchResponse struct {
 	Error  json.RawMessage     `json:"error"`
 }
 
+type publicSearchResult struct {
+	ContentID      string `json:"content_id"`
+	Name           string `json:"name"`
+	TranslatedName string `json:"translated_name"`
+}
+
 type engineSearchResult struct {
 	Total   int                 `json:"total"`
 	Results []engineSearchGroup `json:"results"`
@@ -133,8 +141,10 @@ type engineSearchItem struct {
 }
 
 type searchResult struct {
-	Infohash     string   `json:"infohash"`
+	Infohash     string   `json:"infohash,omitempty"`
+	ContentID    string   `json:"contentId,omitempty"`
 	Name         string   `json:"name"`
+	Source       string   `json:"source,omitempty"`
 	Bitrate      int      `json:"bitrate"`
 	Availability float64  `json:"availability"`
 	Status       int      `json:"status"`
@@ -154,9 +164,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid ACESTREAM_URL: %v", err)
 	}
+	searchURL, err := parseBaseURL(envOr("SEARCH_URL", defaultSearch))
+	if err != nil {
+		log.Fatalf("invalid SEARCH_URL: %v", err)
+	}
 
 	server := &app{
 		engineURL: engineURL,
+		searchURL: searchURL,
 		client: &http.Client{Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -182,7 +197,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.Dir(server.webRoot)))
 
 	address := ":" + port
-	log.Printf("ace-player listening on %s (engine: %s)", address, engineURL.String())
+	log.Printf("ace-player listening on %s (engine: %s, search: %s)", address, engineURL.String(), searchURL.String())
 	if err := http.ListenAndServe(address, securityHeaders(mux)); err != nil {
 		log.Fatal(err)
 	}
@@ -226,49 +241,103 @@ func (a *app) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engineRequestURL := a.engineEndpoint("/search", url.Values{
-		"query":     {query},
-		"page":      {"0"},
-		"page_size": {"50"},
-	})
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, engineRequestURL.String(), nil)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not contact Ace Stream engine")
-		return
+
+	results, publicErr := a.publicSearch(ctx, query)
+	if publicErr != nil {
+		log.Printf("public search unavailable, trying engine search: %v", publicErr)
+		results, publicErr = a.engineSearch(ctx, query)
 	}
-	response, err := a.client.Do(request)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not contact Ace Stream engine")
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		writeError(w, http.StatusBadGateway, "Ace Stream engine rejected the search")
+	if publicErr != nil {
+		writeError(w, http.StatusBadGateway, "stream search is currently unavailable")
 		return
 	}
 
-	var engineResponse engineSearchResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&engineResponse); err != nil {
-		writeError(w, http.StatusBadGateway, "Ace Stream engine returned an invalid search response")
-		return
-	}
-	if message := engineErrorMessage(engineResponse.Error); message != "" {
-		writeError(w, http.StatusBadGateway, message)
-		return
-	}
-	if engineResponse.Result == nil {
-		writeError(w, http.StatusBadGateway, "Ace Stream engine returned no search results")
-		return
-	}
-
-	results := flattenSearchResults(engineResponse.Result.Results)
 	writeJSON(w, http.StatusOK, searchResponse{
 		Query:   query,
 		Total:   len(results),
 		Results: results,
 	})
+}
+
+func (a *app) publicSearch(ctx context.Context, query string) ([]searchResult, error) {
+	requestURL := endpoint(a.searchURL, "/search", url.Values{"query": {query}})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
+	if err != nil {
+		return nil, errors.New("could not contact public search")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return nil, errors.New("could not contact public search")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("public search returned HTTP %d", response.StatusCode)
+	}
+
+	var publicResults []publicSearchResult
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&publicResults); err != nil {
+		return nil, errors.New("public search returned an invalid response")
+	}
+	return flattenPublicSearchResults(publicResults), nil
+}
+
+func (a *app) engineSearch(ctx context.Context, query string) ([]searchResult, error) {
+	engineRequestURL := a.engineEndpoint("/search", url.Values{
+		"query":     {query},
+		"page":      {"0"},
+		"page_size": {"50"},
+	})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, engineRequestURL.String(), nil)
+	if err != nil {
+		return nil, errors.New("could not contact Ace Stream engine")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return nil, errors.New("could not contact Ace Stream engine")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, errors.New("Ace Stream engine rejected the search")
+	}
+
+	var engineResponse engineSearchResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&engineResponse); err != nil {
+		return nil, errors.New("Ace Stream engine returned an invalid search response")
+	}
+	if message := engineErrorMessage(engineResponse.Error); message != "" {
+		return nil, errors.New(message)
+	}
+	if engineResponse.Result == nil {
+		return nil, errors.New("Ace Stream engine returned no search results")
+	}
+	return flattenSearchResults(engineResponse.Result.Results), nil
+}
+
+func flattenPublicSearchResults(items []publicSearchResult) []searchResult {
+	results := make([]searchResult, 0, len(items))
+	seen := make(map[string]struct{})
+	for _, item := range items {
+		contentID := strings.ToLower(strings.TrimSpace(item.ContentID))
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.TranslatedName)
+		}
+		if !contentIDPattern.MatchString(contentID) || name == "" {
+			continue
+		}
+		if _, ok := seen[contentID]; ok {
+			continue
+		}
+		seen[contentID] = struct{}{}
+		results = append(results, searchResult{
+			ContentID: contentID,
+			Name:      name,
+			Source:    "public",
+		})
+	}
+	return results
 }
 
 func flattenSearchResults(groups []engineSearchGroup) []searchResult {
@@ -291,6 +360,7 @@ func flattenSearchResults(groups []engineSearchGroup) []searchResult {
 			add(searchResult{
 				Infohash:     group.Infohash,
 				Name:         group.Name,
+				Source:       "engine",
 				Bitrate:      group.Bitrate,
 				Availability: group.Availability,
 				Status:       group.Status,
@@ -312,6 +382,7 @@ func flattenSearchResults(groups []engineSearchGroup) []searchResult {
 			add(searchResult{
 				Infohash:     item.Infohash,
 				Name:         name,
+				Source:       "engine",
 				Bitrate:      item.Bitrate,
 				Availability: item.Availability,
 				Status:       item.Status,
@@ -758,8 +829,12 @@ func (a *app) cleanupIdleSessions() {
 }
 
 func (a *app) engineEndpoint(requestPath string, query url.Values) *url.URL {
-	result := *a.engineURL
-	result.Path = path.Join(a.engineURL.Path, requestPath)
+	return endpoint(a.engineURL, requestPath, query)
+}
+
+func endpoint(baseURL *url.URL, requestPath string, query url.Values) *url.URL {
+	result := *baseURL
+	result.Path = path.Join(baseURL.Path, requestPath)
 	if !strings.HasPrefix(result.Path, "/") {
 		result.Path = "/" + result.Path
 	}

@@ -42,6 +42,14 @@
 
       <section class="player-screen" id="player-screen" hidden aria-label="Video player">
         <video id="video" controls playsinline preload="metadata" x-webkit-airplay="allow"></video>
+        <div class="playback-status" id="playback-status" role="status" aria-live="polite" hidden>
+          <span class="playback-spinner" aria-hidden="true"></span>
+          <span class="playback-status-copy">
+            <strong id="playback-status-title"></strong>
+            <span id="playback-status-detail" hidden></span>
+          </span>
+          <button id="retry-button" type="button" hidden>Try again</button>
+        </div>
       </section>
     </main>
     <script src="/app.js" defer></script>
