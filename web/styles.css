@@ -283,7 +283,7 @@ input:focus {
   max-width: min(90vw, 420px);
   padding: 14px 17px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 18px;
+  border-radius: 999px;
   background: rgba(24, 24, 28, 0.82);
   color: #fff;
   box-shadow: 0 15px 50px rgba(0, 0, 0, 0.42), inset 0 1px rgba(255, 255, 255, 0.1);
@@ -333,7 +333,7 @@ input:focus {
   flex: 0 0 auto;
   pointer-events: auto;
   border: 0;
-  border-radius: 10px;
+  border-radius: 999px;
   padding: 8px 11px;
   background: rgba(255, 255, 255, 0.14);
   color: #fff;

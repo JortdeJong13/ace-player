@@ -2,6 +2,7 @@
   "use strict";
 
   const stallRecoveryDelay = 10_000;
+  const bufferingStatusDelay = 1_500;
   const startupRecoveryDelay = 60_000;
   const progressTimeout = 15_000;
   const statusPollInterval = 5_000;
@@ -53,6 +54,7 @@
   let lastProgressAt = 0;
   let lastCurrentTime = 0;
   let stallSince = 0;
+  let bufferingStatusTimer = null;
   let stablePlaybackTimer = null;
 
   function homeURL() {
@@ -148,6 +150,7 @@
   }
 
   function setPlaybackStatus(title, detail = "", { error = false, retry = false } = {}) {
+    clearBufferingStatusTimer();
     playbackStatusTitle.textContent = title;
     playbackStatusDetail.textContent = detail;
     playbackStatusDetail.hidden = !detail;
@@ -157,9 +160,16 @@
   }
 
   function hidePlaybackStatus() {
+    clearBufferingStatusTimer();
     playbackStatus.hidden = true;
     playbackStatus.classList.remove("error");
     retryButton.hidden = true;
+  }
+
+  function clearBufferingStatusTimer() {
+    if (!bufferingStatusTimer) return;
+    window.clearTimeout(bufferingStatusTimer);
+    bufferingStatusTimer = null;
   }
 
   function statusPeerDetail(data) {
@@ -169,7 +179,7 @@
   }
 
   function updateStatusFromEngine(data) {
-    if (firstFrameAt || !playbackWanted) return;
+    if (firstFrameAt || !playbackWanted || (!video.paused && video.readyState >= 3)) return;
     const status = String(data.status || "").toLowerCase();
     if (status === "error" || status === "stopped") {
       setPlaybackStatus("Stream unavailable", "The source stopped before Safari received video.", { error: true });
@@ -205,6 +215,7 @@
       window.clearTimeout(stablePlaybackTimer);
       stablePlaybackTimer = null;
     }
+    clearBufferingStatusTimer();
     monitorSessionID = "";
     stallSince = 0;
   }
@@ -227,6 +238,7 @@
     lastCurrentTime = currentTime;
     lastProgressAt = Date.now();
     stallSince = 0;
+    if (playbackWanted && !video.paused) notePlaybackStarted();
   }
 
   function notePlaybackStarted() {
@@ -247,7 +259,12 @@
     if (playbackWanted && !video.paused) {
       if (!stallSince) {
         stallSince = Date.now();
-        setPlaybackStatus("Buffering…", "Waiting for the stream to catch up");
+        bufferingStatusTimer = window.setTimeout(() => {
+          bufferingStatusTimer = null;
+          if (playbackWanted && !video.paused && stallSince) {
+            setPlaybackStatus("Buffering…", "Waiting for the stream to catch up");
+          }
+        }, bufferingStatusDelay);
       }
     }
   }
