@@ -46,6 +46,7 @@ type session struct {
 	id          string
 	contentID   string
 	playbackURL *url.URL
+	statURL     *url.URL
 	commandURL  *url.URL
 	createdAt   time.Time
 	lastAccess  time.Time
@@ -65,9 +66,32 @@ type playResponse struct {
 type enginePlaybackResponse struct {
 	Response *struct {
 		PlaybackURL string `json:"playback_url"`
+		StatURL     string `json:"stat_url"`
 		CommandURL  string `json:"command_url"`
 	} `json:"response"`
 	Error json.RawMessage `json:"error"`
+}
+
+type engineStatusResponse struct {
+	Response *struct {
+		Status    string `json:"status"`
+		Peers     int    `json:"peers"`
+		SpeedDown int    `json:"speed_down"`
+		SpeedUp   int    `json:"speed_up"`
+		LivePos   *struct {
+			BufferPieces json.RawMessage `json:"buffer_pieces"`
+		} `json:"livepos"`
+	} `json:"response"`
+	Error json.RawMessage `json:"error"`
+}
+
+type sessionStatusResponse struct {
+	SessionID    string `json:"sessionId"`
+	Status       string `json:"status"`
+	Peers        int    `json:"peers,omitempty"`
+	SpeedDown    int    `json:"speedDown,omitempty"`
+	SpeedUp      int    `json:"speedUp,omitempty"`
+	BufferPieces int    `json:"bufferPieces,omitempty"`
 }
 
 type stopRequest struct {
@@ -150,6 +174,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /readyz", server.ready)
 	mux.HandleFunc("GET /api/search", server.search)
+	mux.HandleFunc("GET /api/session/{sessionID}/status", server.sessionStatus)
 	mux.HandleFunc("POST /api/play", server.play)
 	mux.HandleFunc("POST /api/stop", server.stop)
 	mux.HandleFunc("GET /stream/{sessionID}/manifest.m3u8", server.manifest)
@@ -364,6 +389,13 @@ func (a *app) play(w http.ResponseWriter, r *http.Request) {
 			commandURL = nil
 		}
 	}
+	var statURL *url.URL
+	if engineResponse.Response.StatURL != "" {
+		statURL, err = url.Parse(engineResponse.Response.StatURL)
+		if err != nil || statURL.Path == "" {
+			statURL = nil
+		}
+	}
 
 	sessionID, err := randomID(16)
 	if err != nil {
@@ -374,6 +406,7 @@ func (a *app) play(w http.ResponseWriter, r *http.Request) {
 		id:          sessionID,
 		contentID:   identifier,
 		playbackURL: playbackURL,
+		statURL:     statURL,
 		commandURL:  commandURL,
 		createdAt:   time.Now(),
 		lastAccess:  time.Now(),
@@ -390,6 +423,54 @@ func (a *app) play(w http.ResponseWriter, r *http.Request) {
 		ContentID: identifier,
 		Manifest:  "/stream/" + sessionID + "/manifest.m3u8",
 	})
+}
+
+func (a *app) sessionStatus(w http.ResponseWriter, r *http.Request) {
+	session := a.getSession(r.PathValue("sessionID"))
+	if session == nil {
+		writeError(w, http.StatusNotFound, "Playback session not found")
+		return
+	}
+	if session.statURL == nil {
+		writeJSON(w, http.StatusOK, sessionStatusResponse{
+			SessionID: session.id,
+			Status:    "unknown",
+		})
+		return
+	}
+
+	response, status, err := a.openResource(r.Context(), a.engineURLFor(session.statURL))
+	if err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	defer response.Body.Close()
+
+	var engineResponse engineStatusResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&engineResponse); err != nil {
+		writeError(w, http.StatusBadGateway, "Ace Stream engine returned an invalid status response")
+		return
+	}
+	if message := engineErrorMessage(engineResponse.Error); message != "" {
+		writeError(w, http.StatusBadGateway, message)
+		return
+	}
+	if engineResponse.Response == nil {
+		writeError(w, http.StatusBadGateway, "Ace Stream engine did not return session status")
+		return
+	}
+
+	statusResponse := sessionStatusResponse{
+		SessionID: session.id,
+		Status:    engineResponse.Response.Status,
+		Peers:     engineResponse.Response.Peers,
+		SpeedDown: engineResponse.Response.SpeedDown,
+		SpeedUp:   engineResponse.Response.SpeedUp,
+	}
+	if engineResponse.Response.LivePos != nil {
+		statusResponse.BufferPieces = rawInt(engineResponse.Response.LivePos.BufferPieces)
+	}
+	writeJSON(w, http.StatusOK, statusResponse)
 }
 
 func engineErrorMessage(raw json.RawMessage) string {
@@ -725,6 +806,21 @@ func normalizePlaybackRequest(input playRequest) (string, string, error) {
 	}
 	contentID, err := normalizeContentID(input.ContentID)
 	return contentID, "content_id", err
+}
+
+func rawInt(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var value int
+	if json.Unmarshal(raw, &value) == nil {
+		return value
+	}
+	var textValue string
+	if json.Unmarshal(raw, &textValue) == nil {
+		value, _ = strconv.Atoi(textValue)
+	}
+	return value
 }
 
 func randomID(bytes int) (string, error) {

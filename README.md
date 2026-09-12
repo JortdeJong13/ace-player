@@ -58,6 +58,8 @@ The backend starts an Ace Stream playback session with the engine's JSON middlew
 
 Audio transcoding is requested from AceServe for Safari compatibility. For example, streams carrying E-AC-3 audio are converted to stereo AAC while the H.264 video is passed through. This uses the existing engine rather than adding a separate FFmpeg service.
 
+While a stream is playing, the browser monitors native media events and polls the session status endpoint. If playback stalls for 10 seconds, stops progressing for 15 seconds, or the engine reports a stopped session, the player starts a fresh engine session with exponential backoff. Startup has a 60-second grace period, and automatic recovery is capped at five attempts. User pauses and navigation never trigger recovery.
+
 The landing screen searches the Ace Stream engine's built-in search module through `GET /api/search?q=...`. The Go server keeps the engine private from the browser and normalizes the grouped engine response into playable results. Search results use the engine's `infohash` identifier; direct 40-character hexadecimal content IDs are still accepted in the same field. Search is intentionally transient and is not written to browser history.
 
 The latest playback identifier and display name are stored in the browser's local storage so it can be resumed from the landing screen. The active stream identifier is also stored in the URL hash as `#stream/content/<id>` or `#stream/infohash/<id>`. This lets Safari restore the player after a refresh and makes Back and Forward navigate between the search screen and the stream. The backend session itself remains disposable: refreshing creates a fresh engine session for the same identifier.

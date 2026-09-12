@@ -1,6 +1,14 @@
 (() => {
   "use strict";
 
+  const stallRecoveryDelay = 10_000;
+  const startupRecoveryDelay = 60_000;
+  const progressTimeout = 15_000;
+  const statusPollInterval = 5_000;
+  const reconnectBaseDelay = 2_000;
+  const reconnectMaxDelay = 30_000;
+  const maxReconnectAttempts = 5;
+
   const latestStorageKey = "ace-player.latest-playback";
   const homeScreen = document.querySelector("#home-screen");
   const playerScreen = document.querySelector("#player-screen");
@@ -21,12 +29,27 @@
   let currentSessionID = "";
   let currentContentID = "";
   let currentSource = "content_id";
+  let currentStreamName = "";
+  let playbackWanted = false;
+  let recoveryInProgress = false;
   let starting = false;
   let startAbortController = null;
   let startPromise = null;
   let searchAbortController = null;
   let searchPromise = null;
   let activeSearchQuery = "";
+  let reconnectTimer = null;
+  let reconnectPromise = null;
+  let reconnectAttempts = 0;
+  let monitorTimer = null;
+  let monitorSessionID = "";
+  let statusPollInFlight = false;
+  let streamStartedAt = 0;
+  let firstFrameAt = 0;
+  let lastProgressAt = 0;
+  let lastCurrentTime = 0;
+  let stallSince = 0;
+  let stablePlaybackTimer = null;
 
   function homeURL() {
     const url = new URL(window.location.href);
@@ -117,6 +140,177 @@
   function showPlayer() {
     homeScreen.hidden = true;
     playerScreen.hidden = false;
+  }
+
+  function stopPlaybackMonitoring() {
+    if (monitorTimer) {
+      window.clearInterval(monitorTimer);
+      monitorTimer = null;
+    }
+    if (stablePlaybackTimer) {
+      window.clearTimeout(stablePlaybackTimer);
+      stablePlaybackTimer = null;
+    }
+    monitorSessionID = "";
+    stallSince = 0;
+  }
+
+  function startPlaybackMonitoring(sessionID, { preserveReconnectAttempts = false } = {}) {
+    stopPlaybackMonitoring();
+    monitorSessionID = sessionID;
+    streamStartedAt = Date.now();
+    firstFrameAt = 0;
+    lastProgressAt = streamStartedAt;
+    lastCurrentTime = video.currentTime;
+    stallSince = 0;
+    if (!preserveReconnectAttempts) reconnectAttempts = 0;
+    monitorTimer = window.setInterval(monitorPlayback, statusPollInterval);
+  }
+
+  function notePlaybackProgress() {
+    const currentTime = video.currentTime;
+    if (!Number.isFinite(currentTime) || currentTime === lastCurrentTime) return;
+    lastCurrentTime = currentTime;
+    lastProgressAt = Date.now();
+    stallSince = 0;
+  }
+
+  function notePlaybackStarted() {
+    if (!currentSessionID) return;
+    const now = Date.now();
+    firstFrameAt ||= now;
+    lastProgressAt = now;
+    stallSince = 0;
+    if (stablePlaybackTimer) window.clearTimeout(stablePlaybackTimer);
+    const sessionID = currentSessionID;
+    stablePlaybackTimer = window.setTimeout(() => {
+      if (sessionID === currentSessionID && !video.paused) reconnectAttempts = 0;
+    }, 30_000);
+  }
+
+  function notePlaybackStall() {
+    if (playbackWanted && !video.paused && !stallSince) stallSince = Date.now();
+  }
+
+  async function pollPlaybackStatus() {
+    const sessionID = monitorSessionID;
+    if (
+      statusPollInFlight ||
+      !sessionID ||
+      sessionID !== currentSessionID ||
+      !playbackWanted ||
+      video.paused ||
+      video.ended
+    ) return;
+
+    statusPollInFlight = true;
+    try {
+      const response = await fetch(`/api/session/${encodeURIComponent(sessionID)}/status`, {
+        cache: "no-store",
+      });
+      if (sessionID !== currentSessionID) return;
+      if (response.status === 404) {
+        scheduleReconnect("engine session disappeared", true);
+        return;
+      }
+      if (!response.ok) return;
+      const data = await response.json().catch(() => ({}));
+      if (sessionID !== currentSessionID) return;
+      if (data.status === "error" || data.status === "stopped") {
+        scheduleReconnect(`engine status: ${data.status}`, true);
+      }
+    } catch (_) {
+      // The playback watchdog handles media stalls if the status request fails.
+    } finally {
+      statusPollInFlight = false;
+    }
+  }
+
+  function monitorPlayback() {
+    if (!monitorSessionID || monitorSessionID !== currentSessionID) {
+      stopPlaybackMonitoring();
+      return;
+    }
+    if (!playbackWanted || video.paused || video.ended) return;
+
+    const now = Date.now();
+    if (stallSince && now - stallSince >= stallRecoveryDelay) {
+      scheduleReconnect("playback stalled");
+      return;
+    }
+    if (!firstFrameAt && now - streamStartedAt >= startupRecoveryDelay) {
+      scheduleReconnect("stream did not start");
+      return;
+    }
+    if (firstFrameAt && now - lastProgressAt >= progressTimeout) {
+      scheduleReconnect("playback stopped progressing");
+      return;
+    }
+    void pollPlaybackStatus();
+  }
+
+  function cancelReconnect() {
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    reconnectAttempts = 0;
+  }
+
+  function scheduleReconnect(reason, immediate = false) {
+    if (
+      !playbackWanted ||
+      recoveryInProgress ||
+      !currentContentID ||
+      reconnectTimer ||
+      reconnectPromise
+    ) return;
+    if (!immediate && video.paused) return;
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      console.warn(`Ace Player: automatic reconnect limit reached (${reason})`);
+      return;
+    }
+
+    const delay = immediate
+      ? 0
+      : Math.min(reconnectMaxDelay, reconnectBaseDelay * (2 ** reconnectAttempts));
+    reconnectAttempts += 1;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      reconnectPromise = reconnectStream(reason).finally(() => {
+        reconnectPromise = null;
+      });
+    }, delay);
+  }
+
+  async function reconnectStream(reason) {
+    const target = {
+      identifier: currentContentID,
+      source: currentSource,
+      name: currentStreamName,
+    };
+    if (!playbackWanted || !target.identifier) return;
+
+    console.info(`Ace Player: reconnecting (${reason})`);
+    recoveryInProgress = true;
+    try {
+      await stopStream({ userInitiated: false });
+      if (!playbackWanted) return;
+      const started = await startStream(target.identifier, {
+        source: target.source,
+        name: target.name,
+        pushHistory: false,
+        reconnecting: true,
+      });
+      if (started || !playbackWanted) return;
+      currentContentID = target.identifier;
+      currentSource = target.source;
+      currentStreamName = target.name;
+      showPlayer();
+      scheduleReconnect("reconnect attempt failed");
+    } finally {
+      recoveryInProgress = false;
+    }
   }
 
   function clearSearchResults() {
@@ -246,11 +440,17 @@
     return promise;
   }
 
-  async function startStreamInternal(identifier, { source = "content_id", name = "", pushHistory = true } = {}) {
+  async function startStreamInternal(
+    identifier,
+    { source = "content_id", name = "", pushHistory = true, reconnecting = false } = {},
+  ) {
     starting = true;
     const requestedIdentifier = identifier.trim();
     currentContentID = requestedIdentifier;
     currentSource = source;
+    currentStreamName = name.trim();
+    playbackWanted = true;
+    if (!reconnecting) cancelReconnect();
     const abortController = new AbortController();
     startAbortController = abortController;
     formMessage.hidden = true;
@@ -266,7 +466,7 @@
         signal: abortController.signal,
       });
       const data = await response.json().catch(() => ({}));
-      if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) return false;
       if (!response.ok) throw new Error(data.error || "Could not start this stream.");
 
       currentSessionID = data.sessionId;
@@ -276,23 +476,40 @@
       showPlayer();
       video.src = data.manifestUrl;
       video.load();
+      startPlaybackMonitoring(currentSessionID, { preserveReconnectAttempts: reconnecting });
       void video.play().catch(() => {});
+      return true;
     } catch (error) {
-      if (error.name === "AbortError") return;
-      currentContentID = "";
-      currentSource = "content_id";
-      showHome(error.message || "Could not start this stream.");
+      if (error.name === "AbortError") return false;
+      currentSessionID = "";
+      if (reconnecting) {
+        currentContentID = requestedIdentifier;
+        currentSource = source;
+        showPlayer();
+      } else {
+        currentContentID = "";
+        currentSource = "content_id";
+        playbackWanted = false;
+        showHome(error.message || "Could not start this stream.");
+      }
+      return false;
     } finally {
       if (startAbortController === abortController) startAbortController = null;
       starting = false;
     }
   }
 
-  async function stopStream() {
+  async function stopStream({ userInitiated = true } = {}) {
+    if (userInitiated) {
+      playbackWanted = false;
+      cancelReconnect();
+    }
     const sessionID = currentSessionID;
     currentSessionID = "";
     currentContentID = "";
     currentSource = "content_id";
+    currentStreamName = "";
+    stopPlaybackMonitoring();
     if (document.pictureInPictureElement === video && document.exitPictureInPicture) {
       await document.exitPictureInPicture().catch(() => {});
     }
@@ -311,6 +528,20 @@
       // The engine also cleans up abandoned playback sessions.
     }
   }
+
+  video.addEventListener("play", () => {
+    playbackWanted = true;
+  });
+  video.addEventListener("playing", notePlaybackStarted);
+  video.addEventListener("timeupdate", notePlaybackProgress);
+  video.addEventListener("waiting", notePlaybackStall);
+  video.addEventListener("stalled", notePlaybackStall);
+  video.addEventListener("error", () => {
+    if (playbackWanted) scheduleReconnect("media error", true);
+  });
+  video.addEventListener("pause", () => {
+    if (!recoveryInProgress && !starting && currentSessionID) playbackWanted = false;
+  });
 
   searchForm.addEventListener("submit", (event) => {
     event.preventDefault();
