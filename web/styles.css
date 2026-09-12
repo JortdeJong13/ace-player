@@ -63,31 +63,8 @@ button {
   padding-top: 9vh;
 }
 
-.brand-lockup {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: rgba(244, 245, 247, 0.72);
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-.brand-mark {
-  width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.92);
-  color: #17181b;
-  font-size: 15px;
-  font-weight: 800;
-}
-
 h1 {
-  margin: 52px 0 10px;
+  margin: 0 0 10px;
   color: #f7f7f8;
   font-size: clamp(36px, 8vw, 54px);
   font-weight: 650;
