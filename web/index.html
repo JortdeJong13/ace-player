@@ -31,11 +31,13 @@
             <p class="empty-message" id="empty-message" hidden>No streams found.</p>
           </section>
 
-          <button class="latest-card" id="latest-button" type="button" hidden>
-            <span class="latest-label">Latest stream</span>
-            <span class="latest-name" id="latest-name"></span>
-            <span class="latest-action">Resume <span aria-hidden="true">&#8594;</span></span>
-          </button>
+          <section class="recent-streams" id="recent-streams" aria-labelledby="recent-title" hidden>
+            <div class="results-heading">
+              <h2 id="recent-title">Recent streams</h2>
+              <span id="recent-count"></span>
+            </div>
+            <div class="results-list" id="recent-list"></div>
+          </section>
 
         </div>
       </section>

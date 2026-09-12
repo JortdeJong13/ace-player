@@ -9,6 +9,7 @@
   const reconnectBaseDelay = 2_000;
   const reconnectMaxDelay = 30_000;
   const maxReconnectAttempts = 5;
+  const maxRecentStreams = 3;
 
   const latestStorageKey = "ace-player.latest-playback";
   const homeScreen = document.querySelector("#home-screen");
@@ -20,8 +21,9 @@
   const resultCount = document.querySelector("#result-count");
   const resultsList = document.querySelector("#results-list");
   const emptyMessage = document.querySelector("#empty-message");
-  const latestButton = document.querySelector("#latest-button");
-  const latestName = document.querySelector("#latest-name");
+  const recentStreams = document.querySelector("#recent-streams");
+  const recentCount = document.querySelector("#recent-count");
+  const recentList = document.querySelector("#recent-list");
   const video = document.querySelector("#video");
   const playbackStatus = document.querySelector("#playback-status");
   const playbackStatusTitle = document.querySelector("#playback-status-title");
@@ -91,48 +93,102 @@
     );
   }
 
-  function storedLatest() {
+  function normalizeStoredPlayback(item) {
+    if (!item || typeof item.identifier !== "string") return null;
+    const identifier = item.identifier.trim();
+    if (!contentIDPattern.test(identifier)) return null;
+    return {
+      identifier: identifier.toLowerCase(),
+      source: item.source === "infohash" ? "infohash" : "content_id",
+      name: typeof item.name === "string" && item.name.trim() ? item.name.trim() : "Direct stream",
+    };
+  }
+
+  function storedRecentStreams() {
     try {
       const raw = window.localStorage.getItem(latestStorageKey) || "";
       if (!raw) {
         const legacy = window.localStorage.getItem(legacyLatestStorageKey) || "";
-        if (!contentIDPattern.test(legacy)) return null;
-        return { identifier: legacy, source: "content_id", name: "Direct stream" };
+        const playback = normalizeStoredPlayback({ identifier: legacy });
+        return playback ? [playback] : [];
       }
       const parsed = JSON.parse(raw);
-      if (!parsed || !contentIDPattern.test(parsed.identifier)) return null;
-      return {
-        identifier: parsed.identifier,
-        source: parsed.source === "infohash" ? "infohash" : "content_id",
-        name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "Direct stream",
-      };
+      const candidates = Array.isArray(parsed) ? parsed : [parsed];
+      const recent = [];
+      const seen = new Set();
+      for (const candidate of candidates) {
+        const playback = normalizeStoredPlayback(candidate);
+        if (!playback) continue;
+        const key = `${playback.source}:${playback.identifier}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        recent.push(playback);
+        if (recent.length === maxRecentStreams) break;
+      }
+      return recent;
     } catch (_) {
-      return null;
+      return [];
     }
   }
 
-  function saveLatest(identifier, source, name = "") {
-    const existing = storedLatest();
-    const displayName = name.trim() || (
-      existing && existing.identifier.toLowerCase() === identifier.toLowerCase() && existing.source === source
-        ? existing.name
-        : "Direct stream"
-    );
+  function saveRecentStream(identifier, source, name = "") {
+    const normalizedIdentifier = identifier.toLowerCase();
+    const recent = storedRecentStreams();
+    const existing = recent.find((item) => (
+      item.identifier === normalizedIdentifier && item.source === source
+    ));
+    const displayName = name.trim() || existing?.name || "Direct stream";
+    const playback = { identifier: normalizedIdentifier, source, name: displayName };
+    const updated = [
+      playback,
+      ...recent.filter((item) => !(item.identifier === normalizedIdentifier && item.source === source)),
+    ].slice(0, maxRecentStreams);
     try {
-      window.localStorage.setItem(latestStorageKey, JSON.stringify({ identifier, source, name: displayName }));
+      window.localStorage.setItem(latestStorageKey, JSON.stringify(updated));
     } catch (_) {
       // Private browsing may deny local storage. Playback still works.
     }
-    renderLatest({ identifier, source, name: displayName });
+    renderRecentStreams(updated);
   }
 
-  function renderLatest(playback = storedLatest()) {
-    if (!playback) {
-      latestButton.hidden = true;
+  function renderRecentStreams(recent = storedRecentStreams()) {
+    recentList.replaceChildren();
+    if (!recent.length) {
+      recentStreams.hidden = true;
       return;
     }
-    latestName.textContent = playback.name || "Direct stream";
-    latestButton.hidden = false;
+    recentStreams.hidden = false;
+    recentCount.textContent = recent.length === 1 ? "1 stream" : `${recent.length} streams`;
+
+    for (const playback of recent) {
+      const button = document.createElement("button");
+      button.className = "result-item recent-item";
+      button.type = "button";
+      button.setAttribute("aria-label", `Resume ${playback.name}`);
+
+      const copy = document.createElement("span");
+      copy.className = "result-copy";
+      const name = document.createElement("strong");
+      name.className = "result-name";
+      name.textContent = playback.name;
+      const metadata = document.createElement("span");
+      metadata.className = "result-meta";
+      metadata.textContent = "Recent";
+      copy.append(name, metadata);
+
+      const action = document.createElement("span");
+      action.className = "result-action";
+      action.setAttribute("aria-hidden", "true");
+      action.textContent = "▶";
+      button.append(copy, action);
+      button.addEventListener("click", () => {
+        void startStream(playback.identifier, {
+          source: playback.source,
+          name: playback.name,
+        });
+      });
+      recentList.append(button);
+    }
   }
 
   function showHome(message = "") {
@@ -576,7 +632,7 @@
 
       currentSessionID = data.sessionId;
       currentContentID = data.contentId;
-      saveLatest(currentContentID, source, name);
+      saveRecentStream(currentContentID, source, name);
       if (pushHistory) pushStreamRoute(currentContentID, source);
       showPlayer();
       setPlaybackStatus("Connecting…", "Waiting for Safari to receive the stream");
@@ -675,13 +731,6 @@
     void searchStreams(query);
   });
 
-  latestButton.addEventListener("click", () => {
-    const latest = storedLatest();
-    if (!latest) return;
-    searchInput.value = latest.identifier;
-    void startStream(latest.identifier, { source: latest.source, name: latest.name });
-  });
-
   async function applyLocation() {
     const playback = playbackFromLocation();
     if (playback) {
@@ -736,7 +785,7 @@
     }).catch(() => {});
   });
 
-  renderLatest();
+  renderRecentStreams();
   if (window.location.hash && !playbackFromLocation()) replaceWithHomeRoute();
   void applyLocation();
 })();
