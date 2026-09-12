@@ -1,0 +1,24 @@
+services:
+  acestream:
+    image: jopsis/aceserve:latest
+    container_name: acestream
+    ports:
+      - "8621:8621"
+      - "8621:8621/udp"
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+
+  ace-player:
+    image: ghcr.io/jortdejong13/ace-player:latest
+    build: .
+    container_name: ace-player
+    ports:
+      - "8082:8080"
+    environment:
+      ACESTREAM_URL: http://acestream:6878
+    depends_on:
+      - acestream
+    restart: unless-stopped
