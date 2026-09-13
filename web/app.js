@@ -10,6 +10,9 @@
   const reconnectMaxDelay = 30_000;
   const maxReconnectAttempts = 5;
   const maxRecentStreams = 3;
+  const defaultPageTitle = document.title;
+  const themeColorMeta = document.querySelector("meta[name='theme-color']");
+  const darkModeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
   const latestStorageKey = "ace-player.latest-playback";
   const homeScreen = document.querySelector("#home-screen");
@@ -58,6 +61,11 @@
   let stallSince = 0;
   let bufferingStatusTimer = null;
   let stablePlaybackTimer = null;
+
+  function syncThemeColor(mediaQuery) {
+    if (!themeColorMeta) return;
+    themeColorMeta.content = mediaQuery.matches ? "#0e1116" : "#f5f7fa";
+  }
 
   function homeURL() {
     const url = new URL(window.location.href);
@@ -195,6 +203,8 @@
     hidePlaybackStatus();
     playerScreen.hidden = true;
     homeScreen.hidden = false;
+    updateMediaSession("none");
+    document.title = defaultPageTitle;
     formMessage.textContent = message;
     formMessage.hidden = !message;
     searchInput.focus({ preventScroll: true });
@@ -234,6 +244,53 @@
     return `${peers} peer${peers === 1 ? "" : "s"} connected`;
   }
 
+  function updateMediaSession(playbackState = "") {
+    if (!("mediaSession" in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState = playbackState;
+    } catch (_) {
+      // Some Safari versions expose mediaSession but reject playbackState updates.
+    }
+  }
+
+  function updateMediaSessionMetadata() {
+    if (!("mediaSession" in navigator) || typeof MediaMetadata === "undefined") return;
+    try {
+      navigator.mediaSession.metadata = currentStreamName
+        ? new MediaMetadata({
+          title: currentStreamName,
+          artist: "Ace Player",
+          artwork: [{ src: "/favicon.png", type: "image/png" }],
+        })
+        : null;
+    } catch (_) {
+      // Media Session is optional; native playback remains unaffected.
+    }
+  }
+
+  function configureMediaSession() {
+    if (!("mediaSession" in navigator)) return;
+    const handlers = {
+      play: () => {
+        void video.play().catch(() => {});
+      },
+      pause: () => video.pause(),
+      stop: () => {
+        void stopStream().then(() => {
+          replaceWithHomeRoute();
+          showHome();
+        });
+      },
+    };
+    for (const [action, handler] of Object.entries(handlers)) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+      } catch (_) {
+        // Action support varies across Safari versions.
+      }
+    }
+  }
+
   function updateStatusFromEngine(data) {
     if (firstFrameAt || !playbackWanted || (!video.paused && video.readyState >= 3)) return;
     const status = String(data.status || "").toLowerCase();
@@ -244,6 +301,10 @@
     const detail = statusPeerDetail(data);
     if (detail.startsWith("Waiting")) {
       setPlaybackStatus("Finding peers…", detail);
+      return;
+    }
+    if (streamStartedAt && Date.now() - streamStartedAt >= 15_000) {
+      setPlaybackStatus("Still buffering…", `${detail} · Waiting for first video`);
       return;
     }
     setPlaybackStatus("Buffering stream…", detail);
@@ -260,6 +321,10 @@
       default:
         return "The stream stopped unexpectedly";
     }
+  }
+
+  function mediaErrorIsRecoverable() {
+    return video.error?.code === MediaError.MEDIA_ERR_NETWORK;
   }
 
   function stopPlaybackMonitoring() {
@@ -480,13 +545,52 @@
     return `${megabits >= 10 ? megabits.toFixed(0) : megabits.toFixed(1)} Mbps`;
   }
 
+  function resultLanguage(result) {
+    const declaredLanguage = Array.isArray(result.languages)
+      ? result.languages.find((language) => typeof language === "string" && language.trim())
+      : "";
+    if (declaredLanguage) {
+      const languageCode = declaredLanguage.trim().toLowerCase();
+      const declaredLabels = {
+        en: "English",
+        eng: "English",
+        es: "Spanish",
+        spa: "Spanish",
+        fr: "French",
+        fra: "French",
+        de: "German",
+        deu: "German",
+        nl: "Dutch",
+        nld: "Dutch",
+        pt: "Portuguese",
+        por: "Portuguese",
+        ru: "Russian",
+        rus: "Russian",
+      };
+      return declaredLabels[languageCode] || declaredLanguage.trim();
+    }
+
+    const name = String(result.name || "");
+    const labels = [
+      ["English", /(?:\benglish\b|\beng\b|\[en\])/i],
+      ["Russian", /(?:\brussian\b|\brus\b|\[ru\]|рус)/i],
+      ["Dutch", /(?:\bdutch\b|\bnederlands\b|\[nl\])/i],
+      ["Spanish", /(?:\bspanish\b|\bespañol\b|\[es\])/i],
+      ["German", /(?:\bgerman\b|\bdeutsch\b|\[de\])/i],
+      ["French", /(?:\bfrench\b|\bfrançais\b|\[fr\])/i],
+    ];
+    return labels.find(([, pattern]) => pattern.test(name))?.[0] || "";
+  }
+
   function resultMetadata(result) {
-    if (result.source === "public") return "Live index";
+    const language = resultLanguage(result);
+    if (result.source === "public") {
+      return ["Live index", language].filter(Boolean).join(" · ");
+    }
     const parts = [result.status === 2 ? "Available" : "Uncertain"];
-    const language = result.languages?.[0];
     const country = result.countries?.[0];
     const bitrate = formatBitrate(result.bitrate);
-    if (language) parts.push(language.toUpperCase());
+    if (language) parts.push(language);
     if (country) parts.push(country.toUpperCase());
     if (bitrate) parts.push(bitrate);
     return parts.join(" · ");
@@ -633,6 +737,9 @@
       currentSessionID = data.sessionId;
       currentContentID = data.contentId;
       saveRecentStream(currentContentID, source, name);
+      document.title = currentStreamName ? `${currentStreamName} · Ace Player` : defaultPageTitle;
+      updateMediaSessionMetadata();
+      updateMediaSession("none");
       if (pushHistory) pushStreamRoute(currentContentID, source);
       showPlayer();
       setPlaybackStatus("Connecting…", "Waiting for Safari to receive the stream");
@@ -676,6 +783,9 @@
     currentContentID = "";
     currentSource = "content_id";
     currentStreamName = "";
+    document.title = defaultPageTitle;
+    updateMediaSessionMetadata();
+    updateMediaSession("none");
     stopPlaybackMonitoring();
     if (document.pictureInPictureElement === video && document.exitPictureInPicture) {
       await document.exitPictureInPicture().catch(() => {});
@@ -698,23 +808,36 @@
 
   video.addEventListener("play", () => {
     playbackWanted = true;
+    updateMediaSession("playing");
   });
-  video.addEventListener("playing", notePlaybackStarted);
+  video.addEventListener("playing", () => {
+    notePlaybackStarted();
+    updateMediaSession("playing");
+  });
   video.addEventListener("timeupdate", notePlaybackProgress);
   video.addEventListener("waiting", notePlaybackStall);
   video.addEventListener("stalled", notePlaybackStall);
   video.addEventListener("error", () => {
     if (playbackWanted) {
-      setPlaybackStatus(mediaErrorMessage(), "Trying to restore the connection");
-      scheduleReconnect("media error", true);
+      const recoverable = mediaErrorIsRecoverable();
+      setPlaybackStatus(
+        mediaErrorMessage(),
+        recoverable
+          ? "Trying to restore the connection"
+          : "Try another source; this stream is not playable in Safari.",
+        { error: true, retry: !recoverable },
+      );
+      if (recoverable) scheduleReconnect("media error", true);
     }
   });
   video.addEventListener("pause", () => {
-    if (!recoveryInProgress && !starting && currentSessionID) {
+    updateMediaSession("paused");
+    if (!recoveryInProgress && !starting && currentSessionID && !video.error) {
       playbackWanted = false;
       hidePlaybackStatus();
     }
   });
+  video.addEventListener("ended", () => updateMediaSession("none"));
 
   retryButton.addEventListener("click", () => {
     void retryPlayback();
@@ -751,7 +874,14 @@
         await searchPromise;
       }
       await stopStream();
-      await startStream(playback.identifier, { source: playback.source, pushHistory: false });
+      const recent = storedRecentStreams().find((item) => (
+        item.identifier === playback.identifier && item.source === playback.source
+      ));
+      await startStream(playback.identifier, {
+        source: playback.source,
+        name: recent?.name || "",
+        pushHistory: false,
+      });
       return;
     }
 
@@ -785,7 +915,23 @@
     }).catch(() => {});
   });
 
+  window.addEventListener("keydown", (event) => {
+    if (homeScreen.hidden) return;
+    if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+    event.preventDefault();
+    searchInput.focus({ preventScroll: true });
+    searchInput.select();
+  });
+
+  syncThemeColor(darkModeQuery);
+  if (darkModeQuery.addEventListener) {
+    darkModeQuery.addEventListener("change", syncThemeColor);
+  } else {
+    darkModeQuery.addListener(syncThemeColor);
+  }
+
   renderRecentStreams();
+  configureMediaSession();
   if (window.location.hash && !playbackFromLocation()) replaceWithHomeRoute();
   void applyLocation();
 })();

@@ -194,7 +194,14 @@ func main() {
 	mux.HandleFunc("POST /api/stop", server.stop)
 	mux.HandleFunc("GET /stream/{sessionID}/manifest.m3u8", server.manifest)
 	mux.HandleFunc("GET /stream/{sessionID}/resource", server.resource)
-	mux.Handle("/", http.FileServer(http.Dir(server.webRoot)))
+	staticFiles := http.FileServer(http.Dir(server.webRoot))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Revalidate UI assets after deployments, including equal-size Docker files.
+		w.Header().Set("Cache-Control", "no-store")
+		r.Header.Del("If-Modified-Since")
+		r.Header.Del("If-None-Match")
+		staticFiles.ServeHTTP(w, r)
+	}))
 
 	address := ":" + port
 	log.Printf("ace-player listening on %s (engine: %s, search: %s)", address, engineURL.String(), searchURL.String())
